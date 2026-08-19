@@ -1,0 +1,26 @@
+{
+  "name": "scm-diff-stats",
+  "displayName": "SCM Diff Stats",
+  "description": "Per-file +/- line stats for working tree changes and recent commits, per repo/worktree.",
+  "version": "0.3.0",
+  "publisher": "simon",
+  "engines": { "vscode": "^1.75.0" },
+  "categories": ["Other"],
+  "main": "./extension.js",
+  "activationEvents": ["onStartupFinished"],
+  "contributes": {
+    "views": {
+      "scm": [
+        { "type": "webview", "id": "scmDiffStats", "name": "Diff Stats" }
+      ]
+    },
+    "commands": [
+      { "command": "scmDiffStats.refresh", "title": "Refresh Diff Stats", "icon": "$(refresh)" }
+    ],
+    "menus": {
+      "view/title": [
+        { "command": "scmDiffStats.refresh", "when": "view == scmDiffStats", "group": "navigation" }
+      ]
+    }
+  }
+}
