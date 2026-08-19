@@ -13,6 +13,7 @@ with zipfile.ZipFile(sys.argv[1], 'w', zipfile.ZIP_DEFLATED) as z:
     z.write('[Content_Types].xml')
     z.write('extension/package.json')
     z.write('extension/extension.js')
+    z.write('extension/media/diff-stats.svg')
 print(f'built {sys.argv[1]}')
 EOF
 

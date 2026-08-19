@@ -13,6 +13,14 @@ function git(cwd, args) {
   });
 }
 
+function gitFull(cwd, args) {
+  return new Promise((resolve) => {
+    cp.execFile('git', args, { cwd, maxBuffer: 16 * 1024 * 1024 }, (err, stdout, stderr) => {
+      resolve({ code: err ? (typeof err.code === 'number' ? err.code : 1) : 0, out: stdout || '', err: stderr || '' });
+    });
+  });
+}
+
 function parseNumstat(out) {
   const files = [];
   for (const line of out.split('\n')) {
@@ -149,6 +157,7 @@ async function collectRepo(repoPath) {
     vsMaster,
     commits: shownCommits,
     commitsLabel,
+    upstream: aheadUpstream != null,
   };
 }
 
@@ -177,6 +186,19 @@ function getHtml(nonce) {
   .st-R, .st-C { color: var(--vscode-gitDecoration-renamedResourceForeground); }
   .behind { color: var(--vscode-gitDecoration-deletedResourceForeground); }
   .empty { padding: 8px; opacity: .6; }
+  .cbox { display: flex; gap: 4px; padding: 3px 8px 5px 18px; }
+  .cmsg { flex: 1; min-width: 0; background: var(--vscode-input-background); color: var(--vscode-input-foreground);
+          border: 1px solid var(--vscode-input-border, transparent); border-radius: 2px; padding: 2px 6px;
+          font-family: inherit; font-size: inherit; outline: none; }
+  .cmsg:focus { border-color: var(--vscode-focusBorder); }
+  .cmsg::placeholder { color: var(--vscode-input-placeholderForeground); }
+  .cbtn { background: var(--vscode-button-background); color: var(--vscode-button-foreground); border: none;
+          border-radius: 2px; padding: 2px 8px; cursor: pointer; font-family: inherit; font-size: inherit; white-space: nowrap; }
+  .cbtn:hover { background: var(--vscode-button-hoverBackground); }
+  .sbtn { background: var(--vscode-button-secondaryBackground); color: var(--vscode-button-secondaryForeground);
+          border: none; border-radius: 2px; padding: 0 6px; margin-left: 8px; cursor: pointer;
+          font-family: inherit; font-size: .85em; height: 18px; white-space: nowrap; flex: none; }
+  .sbtn:hover { background: var(--vscode-button-secondaryHoverBackground); }
 </style>
 </head>
 <body>
@@ -184,8 +206,12 @@ function getHtml(nonce) {
 <script nonce="${nonce}">
 const vscode = acquireVsCodeApi();
 let repos = [];
+let syncEnabled = false;
+let pendingRepos = null;
 const commitFiles = {};
 const state = vscode.getState() || { collapsed: {} };
+state.collapsed = state.collapsed || {};
+state.drafts = state.drafts || {};
 
 function esc(s) { return String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
 function isCollapsed(id, dflt) { return state.collapsed[id] !== undefined ? state.collapsed[id] : dflt; }
@@ -206,6 +232,7 @@ function row(depth, opts) {
     + twist
     + '<span class="name">' + opts.name + '</span>'
     + (opts.dim ? '<span class="dim">' + opts.dim + '</span>' : '')
+    + (opts.btns || '')
     + '<span class="spacer"></span>'
     + (opts.cols || '')
     + '</div>';
@@ -233,6 +260,17 @@ function render() {
       cols: (t.add || t.del) ? cols(t.add, t.del, null, false) : '', act: 't|' + rid + '|0' });
     if (rc) continue;
 
+    if (r.staged.length + r.unstaged.length + r.untracked.length > 0) {
+      const draft = state.drafts[r.repoPath] || '';
+      h += '<div class="cbox">'
+        + '<input class="cmsg" data-repo="' + esc(r.repoPath) + '" placeholder="Commit message" value="' + esc(draft) + '">'
+        + '<button class="cbtn" data-repo="' + esc(r.repoPath) + '" data-push="0" title="git add -A && git commit">Commit all</button>'
+        + (r.upstream
+          ? '<button class="cbtn" data-repo="' + esc(r.repoPath) + '" data-push="1" title="commit, then push to the PR branch">+ Push</button>'
+          : '')
+        + '</div>';
+    }
+
     const sections = [
       ['staged', 'Staged', r.staged, false],
       ['changes', 'Changes', [...r.unstaged, ...r.untracked], false],
@@ -256,6 +294,7 @@ function render() {
         : 'not behind master';
       h += row(1, { hdr: true, twist: vc, name: 'Vs master (' + v.files.length + ')',
         dim: behind + ' · ↑' + v.ahead, cols: cols(v.totals.add, v.totals.del, null, false),
+        btns: syncEnabled ? '<button class="sbtn" data-repo="' + esc(r.repoPath) + '" title="merge master in, run the full test suite, launch a fix agent on failure">⇣ sync + test</button>' : '',
         act: 't|' + vid + '|0' });
       if (!vc) for (const f of v.files) {
         h += fileRow(2, r.repoPath, f, 'm|' + r.repoPath + '|' + v.mergeBase + '|' + f.path);
@@ -286,7 +325,43 @@ function render() {
   root.innerHTML = h;
 }
 
+function doCommit(repoPath, push) {
+  const msg = (state.drafts[repoPath] || '').trim();
+  if (!msg) return;
+  vscode.postMessage({ type: 'commit', repoPath, message: msg, push });
+}
+
+document.addEventListener('input', (ev) => {
+  if (ev.target.classList && ev.target.classList.contains('cmsg')) {
+    state.drafts[ev.target.dataset.repo] = ev.target.value;
+    vscode.setState(state);
+  }
+});
+
+document.addEventListener('keydown', (ev) => {
+  if (ev.target.classList && ev.target.classList.contains('cmsg') && ev.key === 'Enter') {
+    doCommit(ev.target.dataset.repo, ev.ctrlKey || ev.metaKey);
+  }
+});
+
+// pointerdown fires before the input's focusout, so a deferred render can't swallow the click
+document.addEventListener('pointerdown', (ev) => {
+  const btn = ev.target.closest && ev.target.closest('button.cbtn');
+  if (btn) { ev.preventDefault(); doCommit(btn.dataset.repo, btn.dataset.push === '1'); return; }
+  const sbtn = ev.target.closest && ev.target.closest('button.sbtn');
+  if (sbtn) { ev.preventDefault(); vscode.postMessage({ type: 'synctest', repoPath: sbtn.dataset.repo }); }
+});
+
+document.addEventListener('focusout', (ev) => {
+  if (pendingRepos && ev.target.classList && ev.target.classList.contains('cmsg')) {
+    repos = pendingRepos;
+    pendingRepos = null;
+    setTimeout(render, 100);
+  }
+});
+
 document.addEventListener('click', (ev) => {
+  if (ev.target.closest('button')) return;
   const el = ev.target.closest('.row');
   if (!el || !el.dataset.act) return;
   const act = el.dataset.act;
@@ -318,8 +393,22 @@ document.addEventListener('click', (ev) => {
 
 window.addEventListener('message', (ev) => {
   const m = ev.data;
-  if (m.type === 'data') { repos = m.repos; render(); }
+  if (m.type === 'data') {
+    syncEnabled = !!m.syncEnabled;
+    // don't re-render while a commit message is being typed
+    if (document.activeElement && document.activeElement.classList && document.activeElement.classList.contains('cmsg')) {
+      pendingRepos = m.repos;
+    } else {
+      repos = m.repos;
+      render();
+    }
+  }
   else if (m.type === 'commitFiles') { commitFiles[m.repoPath + '|' + m.hash] = m.files; render(); }
+  else if (m.type === 'committed') {
+    delete state.drafts[m.repoPath];
+    vscode.setState(state);
+    render();
+  }
 });
 
 function sumFiles(files) {
@@ -332,12 +421,100 @@ vscode.postMessage({ type: 'ready' });
 </html>`;
 }
 
+function findClaudeBin() {
+  try {
+    const extDir = path.join(process.env.HOME || '', '.vscode-server', 'extensions');
+    const candidates = fs.readdirSync(extDir)
+      .filter((d) => d.startsWith('anthropic.claude-code-'))
+      .sort()
+      .reverse()
+      .map((d) => path.join(extDir, d, 'resources', 'native-binary', 'claude'))
+      .filter((p) => fs.existsSync(p));
+    if (candidates.length) return candidates[0];
+  } catch { /* fall through */ }
+  return 'claude';
+}
+
 class StatsViewProvider {
   constructor() {
     this.view = null;
     this.repos = [];
     this.data = new Map();
     this.fileStats = new Map();
+    this.running = new Set();
+    this.channel = vscode.window.createOutputChannel('Diff Stats');
+  }
+
+  syncCommand() {
+    return (vscode.workspace.getConfiguration('scmDiffStats').get('syncTestCommand') || '').trim();
+  }
+
+  async runSyncTest(repoPath) {
+    const name = path.basename(repoPath);
+    const d = this.data.get(repoPath);
+    const branch = d ? d.branch : '';
+    if (this.running.has(repoPath)) {
+      vscode.window.showWarningMessage(`${name}: sync + test is already running`);
+      return;
+    }
+    const template = this.syncCommand();
+    if (!template) {
+      vscode.window.showErrorMessage('Set scmDiffStats.syncTestCommand in your settings first.');
+      return;
+    }
+    const dirty = (await git(repoPath, ['status', '--porcelain'])).trim();
+    if (dirty) {
+      vscode.window.showWarningMessage(`${name}: commit or stash the working tree changes first.`);
+      return;
+    }
+    const cmd = template
+      .replace(/\$\{name\}/g, name)
+      .replace(/\$\{branch\}/g, branch)
+      .replace(/\$\{repoPath\}/g, repoPath);
+
+    this.running.add(repoPath);
+    this.channel.appendLine(`\n=== ${new Date().toLocaleTimeString()} · ${name}: ${cmd}`);
+    let tail = '';
+    const append = (buf) => {
+      const s = buf.toString();
+      this.channel.append(s);
+      tail = (tail + s).slice(-4000);
+    };
+    try {
+      const code = await vscode.window.withProgress(
+        { location: vscode.ProgressLocation.Window, title: `sync + test: ${name}` },
+        () => new Promise((resolve) => {
+          const child = cp.spawn('bash', ['-lc', cmd], { cwd: repoPath });
+          child.stdout.on('data', append);
+          child.stderr.on('data', append);
+          child.on('close', resolve);
+          child.on('error', (e) => { append(String(e)); resolve(1); });
+        })
+      );
+      if (code === 0) {
+        vscode.window.setStatusBarMessage(`$(check) ${name}: synced with master, tests green`, 8000);
+      } else {
+        this.channel.show(true);
+        this.launchFixAgent(repoPath, name, branch, tail);
+      }
+    } finally {
+      this.running.delete(repoPath);
+      this.refresh();
+    }
+  }
+
+  launchFixAgent(repoPath, name, branch, tail) {
+    const prompt =
+      `The command "sync + test" for worktree ${name} (branch ${branch}, path ${repoPath}) failed. ` +
+      `It runs the repository's test-integration flow: merge local master into the branch, then run the full test suite. ` +
+      `Diagnose and fix the problem (merge conflicts and/or test failures) so the flow passes, following the repository rules. ` +
+      `The output ended with:\n\n${tail}`;
+    const promptFile = path.join(require('os').tmpdir(), `scm-diff-stats-fix-${Date.now()}.txt`);
+    fs.writeFileSync(promptFile, prompt);
+    const term = vscode.window.createTerminal({ name: `fix ${name}`, cwd: repoPath });
+    term.show();
+    term.sendText(`${findClaudeBin()} "$(cat '${promptFile}')"`);
+    vscode.window.showWarningMessage(`${name}: sync + test failed — launched a fix agent in the terminal.`);
   }
 
   setRepos(paths) {
@@ -362,7 +539,7 @@ class StatsViewProvider {
   push() {
     if (!this.view) return;
     const repos = this.repos.filter((r) => this.data.has(r)).map((r) => this.data.get(r));
-    this.view.webview.postMessage({ type: 'data', repos });
+    this.view.webview.postMessage({ type: 'data', repos, syncEnabled: !!this.syncCommand() });
   }
 
   resolveWebviewView(view) {
@@ -384,6 +561,27 @@ class StatsViewProvider {
       const letters = parseNameStatus(nsOut);
       const files = parseNumstat(numOut).map((f) => ({ ...f, letter: letters[f.path] || 'M' }));
       if (this.view) this.view.webview.postMessage({ type: 'commitFiles', repoPath: m.repoPath, hash: m.hash, files });
+    } else if (m.type === 'synctest') {
+      this.runSyncTest(m.repoPath);
+    } else if (m.type === 'commit') {
+      const repoName = path.basename(m.repoPath);
+      const steps = [
+        ['add', '-A'],
+        ['commit', '-m', m.message],
+      ];
+      if (m.push) steps.push(['push']);
+      for (const args of steps) {
+        const r = await gitFull(m.repoPath, args);
+        if (r.code !== 0) {
+          vscode.window.showErrorMessage(`${repoName}: git ${args[0]} failed — ${(r.err || r.out).trim().slice(0, 300)}`);
+          this.refresh();
+          return;
+        }
+      }
+      const sha = (await git(m.repoPath, ['rev-parse', '--short', 'HEAD'])).trim();
+      vscode.window.setStatusBarMessage(`$(check) ${repoName}: committed ${sha}${m.push ? ' and pushed' : ''}`, 5000);
+      if (this.view) this.view.webview.postMessage({ type: 'committed', repoPath: m.repoPath });
+      this.refresh();
     } else if (m.type === 'open') {
       const uri = vscode.Uri.file(path.join(m.repoPath, m.path));
       const base = path.basename(m.path);

@@ -2,15 +2,20 @@
   "name": "scm-diff-stats",
   "displayName": "SCM Diff Stats",
   "description": "Per-file +/- line stats for working tree changes and recent commits, per repo/worktree.",
-  "version": "0.3.0",
+  "version": "0.6.0",
   "publisher": "simon",
   "engines": { "vscode": "^1.75.0" },
   "categories": ["Other"],
   "main": "./extension.js",
   "activationEvents": ["onStartupFinished"],
   "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        { "id": "diffStats", "title": "Diff Stats", "icon": "media/diff-stats.svg" }
+      ]
+    },
     "views": {
-      "scm": [
+      "diffStats": [
         { "type": "webview", "id": "scmDiffStats", "name": "Diff Stats" }
       ]
     },
@@ -21,6 +26,16 @@
       "view/title": [
         { "command": "scmDiffStats.refresh", "when": "view == scmDiffStats", "group": "navigation" }
       ]
+    },
+    "configuration": {
+      "title": "SCM Diff Stats",
+      "properties": {
+        "scmDiffStats.syncTestCommand": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Shell command for the per-repo **⇣ sync + test** button (empty hides the button). Placeholders: `${name}` (worktree folder name), `${branch}`, `${repoPath}`. Runs via `bash -lc` in the repo. Non-zero exit launches a Claude fix agent in a terminal at the worktree."
+        }
+      }
     }
   }
 }
