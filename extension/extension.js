@@ -358,8 +358,8 @@ function render() {
       const byKind = {};
       for (const a of ag) byKind[a.kind] = (byKind[a.kind] || 0) + 1;
       const label = Object.entries(byKind).map(([k, n]) => (n > 1 ? k + ' ×' + n : k)).join(', ');
-      agentHtml = '<span class="agent" title="agent process(es) running in this worktree: '
-        + esc(ag.map(a => a.kind + ' (pid ' + a.pid + ')').join(', ')) + '">● ' + esc(label) + '</span>';
+      agentHtml = '<span class="agent" title="agent session(s) working in this worktree: '
+        + esc(ag.map(a => a.kind + (a.name ? ' “' + a.name + '”' : '') + ' (pid ' + a.pid + ')').join(', ')) + '">● ' + esc(label) + '</span>';
     }
     const ci = ciHtml(r);
     const previewBtn = (!ci && previewEnabled && r.branch !== 'master')
@@ -549,19 +549,71 @@ vscode.postMessage({ type: 'ready' });
 </html>`;
 }
 
+// Which repo is a claude session actually working in? The IDE spawns every
+// session at the workspace root, so the process cwd says "master" even when
+// the session spends all its time in a pr-N worktree. But the session's
+// transcript (~/.claude/sessions/<pid>.json → sessionId →
+// ~/.claude/projects/<encoded-cwd>/<sessionId>.jsonl) records every tool
+// call, so the repo root dominating its tail is where the work happens.
+const TRANSCRIPT_TAIL = 256 * 1024;
+function claudeSessionRepo(c, repoPaths) {
+  try {
+    const home = process.env.HOME || '';
+    const meta = JSON.parse(fs.readFileSync(path.join(home, '.claude', 'sessions', c.pid + '.json')));
+    if (!meta.sessionId || !meta.cwd) return null;
+    // pid-reuse guard: the record must describe this very process
+    if (meta.procStart && String(meta.procStart) !== String(c.start)) return null;
+    const proj = String(meta.cwd).replace(/[^a-zA-Z0-9]/g, '-');
+    const file = path.join(home, '.claude', 'projects', proj, meta.sessionId + '.jsonl');
+    const fd = fs.openSync(file, 'r');
+    let tail;
+    try {
+      const size = fs.fstatSync(fd).size;
+      const n = Math.min(size, TRANSCRIPT_TAIL);
+      const buf = Buffer.alloc(n);
+      fs.readSync(fd, buf, 0, n, size - n);
+      tail = buf.toString('utf8');
+    } finally { fs.closeSync(fd); }
+    // mentions of each known repo root, boundary-checked so a root never
+    // counts on a longer path (…/kylie on …/kylie-worktrees, pr-2 on pr-23);
+    // the per-entry "cwd" field is bookkeeping, not work — subtract it
+    const counts = [];
+    for (const rp of repoPaths) {
+      let n = 0;
+      for (let i = tail.indexOf(rp); i !== -1; i = tail.indexOf(rp, i + rp.length)) {
+        const ch = tail[i + rp.length];
+        if (ch === undefined || !/[A-Za-z0-9_.-]/.test(ch)) n++;
+      }
+      const cwdField = '"cwd":"' + rp + '"';
+      for (let i = tail.indexOf(cwdField); i !== -1; i = tail.indexOf(cwdField, i + cwdField.length)) n--;
+      if (n > 0) counts.push({ rp, n });
+    }
+    counts.sort((a, b) => b.n - a.n);
+    // a clear winner only: enough mentions, and dominant over the runner-up
+    // (a session that merely lists all worktrees names them all about equally)
+    const top = counts[0];
+    const repo = top && top.n >= 5 && (!counts[1] || top.n >= 2 * counts[1].n) ? top.rp : null;
+    return { repo, name: meta.name || '' };
+  } catch {
+    return null; // no session record or transcript — fall back to process cwd
+  }
+}
+
 function scanAgents(repoPaths) {
-  // agent processes (claude/codex) whose cwd is inside one of the repos
+  // agent processes (claude/codex) attributed to the repo they work in
   const map = {};
   const candidates = [];
   let pids = [];
   try { pids = fs.readdirSync('/proc').filter((d) => /^\d+$/.test(d)); } catch { return map; }
   for (const pid of pids) {
-    let cwd, cmd, ppid = 0;
+    let cwd, cmd, ppid = 0, start = '';
     try {
       cwd = fs.readlinkSync(`/proc/${pid}/cwd`);
       cmd = fs.readFileSync(`/proc/${pid}/cmdline`).toString().split('\0').filter(Boolean);
       const stat = fs.readFileSync(`/proc/${pid}/stat`).toString();
-      ppid = +stat.slice(stat.lastIndexOf(')') + 2).split(' ')[1];
+      const f = stat.slice(stat.lastIndexOf(')') + 2).split(' ');
+      ppid = +f[1];
+      start = f[19]; // starttime, matches the session record's procStart
     } catch { continue; }
     if (!cmd.length) continue;
     const exe = path.basename(cmd[0]);
@@ -569,18 +621,23 @@ function scanAgents(repoPaths) {
     if (exe === 'claude' || cmd[0].includes('native-binary/claude')) kind = 'claude';
     else if (exe === 'codex') kind = 'codex';
     else continue;
-    candidates.push({ pid: +pid, ppid, kind, cwd });
+    candidates.push({ pid: +pid, ppid, kind, cwd, start });
   }
   // one session = one badge: drop children whose parent is itself an agent process
   const agentPids = new Set(candidates.map((c) => c.pid));
   for (const c of candidates) {
     if (agentPids.has(c.ppid)) continue;
-    for (const rp of repoPaths) {
-      if (c.cwd === rp || c.cwd.startsWith(rp + path.sep)) {
-        (map[rp] = map[rp] || []).push({ pid: c.pid, kind: c.kind });
-        break;
+    let repo = null, name = '';
+    if (c.kind === 'claude') {
+      const s = claudeSessionRepo(c, repoPaths);
+      if (s) { repo = s.repo; name = s.name; }
+    }
+    if (!repo) {
+      for (const rp of repoPaths) {
+        if (c.cwd === rp || c.cwd.startsWith(rp + path.sep)) { repo = rp; break; }
       }
     }
+    if (repo) (map[repo] = map[repo] || []).push({ pid: c.pid, kind: c.kind, name });
   }
   return map;
 }

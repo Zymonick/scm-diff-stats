@@ -2,7 +2,7 @@
   "name": "scm-diff-stats",
   "displayName": "SCM Diff Stats",
   "description": "Per-file +/- line stats for working tree changes and recent commits, per repo/worktree.",
-  "version": "0.10.1",
+  "version": "0.11.0",
   "publisher": "simon",
   "engines": { "vscode": "^1.75.0" },
   "categories": ["Other"],
