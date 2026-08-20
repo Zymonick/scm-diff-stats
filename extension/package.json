@@ -2,7 +2,7 @@
   "name": "scm-diff-stats",
   "displayName": "SCM Diff Stats",
   "description": "Per-file +/- line stats for working tree changes and recent commits, per repo/worktree.",
-  "version": "0.6.0",
+  "version": "0.10.1",
   "publisher": "simon",
   "engines": { "vscode": "^1.75.0" },
   "categories": ["Other"],
@@ -30,10 +30,25 @@
     "configuration": {
       "title": "SCM Diff Stats",
       "properties": {
+        "scmDiffStats.ciCommand": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Absolute path to the repository's `scripts/ci` tool (empty hides the CI controls). Enables per-PR icon buttons — ▷ `preview N`, ⇣ `test N --fix`, ⇪ `land N` (interactive terminal) — plus ✚ `new <slug>` on the master row, and a land-readiness indicator (✓ ready · ↓ behind master · ○ not tested) from `.ci/pr-N.tested.json`. PR worktrees with these controls hide the generic sync/preview buttons."
+        },
         "scmDiffStats.syncTestCommand": {
           "type": "string",
           "default": "",
           "markdownDescription": "Shell command for the per-repo **⇣ sync + test** button (empty hides the button). Placeholders: `${name}` (worktree folder name), `${branch}`, `${repoPath}`. Runs via `bash -lc` in the repo. Non-zero exit launches a Claude fix agent in a terminal at the worktree."
+        },
+        "scmDiffStats.previewCommand": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Shell command for the per-repo **▷ preview** button (empty hides the button). Must print the preview base URL (`http://…`) on stdout. Placeholders: `${name}`, `${repoPath}`. After it succeeds, the worktree's `.frontend-review.json` pages (max 5) are opened in the browser."
+        },
+        "scmDiffStats.browserCommand": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Shell command used to open the preview pages. `${urls}` is replaced with the quoted URLs. Empty falls back to the OS default browser (one call per URL, no window grouping)."
         }
       }
     }

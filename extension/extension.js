@@ -21,6 +21,15 @@ function gitFull(cwd, args) {
   });
 }
 
+// Empty-document scheme for diff sides that do not exist at a ref
+// (file added or deleted between the two sides).
+const EMPTY_SCHEME = 'scm-diff-stats-empty';
+const emptyUri = (uri) => uri.with({ scheme: EMPTY_SCHEME });
+
+async function existsAtRef(repoPath, ref, relPath) {
+  return (await gitFull(repoPath, ['cat-file', '-e', `${ref}:${relPath}`])).code === 0;
+}
+
 function parseNumstat(out) {
   const files = [];
   for (const line of out.split('\n')) {
@@ -76,11 +85,10 @@ function countLines(file) {
 }
 
 async function collectRepo(repoPath) {
-  const [unstagedOut, stagedOut, untrackedOut, logOut, branchOut, statusOut] = await Promise.all([
+  const [unstagedOut, stagedOut, untrackedOut, branchOut, statusOut] = await Promise.all([
     git(repoPath, ['diff', '--numstat']),
     git(repoPath, ['diff', '--numstat', '--cached']),
     git(repoPath, ['ls-files', '--others', '--exclude-standard']),
-    git(repoPath, ['log', '-n', '30', '--pretty=format:%x01%H%x02%h%x02%s%x02%cr', '--shortstat']),
     git(repoPath, ['rev-parse', '--abbrev-ref', 'HEAD']),
     git(repoPath, ['status', '--porcelain']),
   ]);
@@ -107,8 +115,9 @@ async function collectRepo(repoPath) {
   });
 
   let vsMaster = null;
+  let masterSha = '';
   if (branch && branch !== 'master') {
-    const masterSha = (await git(repoPath, ['rev-parse', '--verify', '--quiet', 'master'])).trim();
+    masterSha = (await git(repoPath, ['rev-parse', '--verify', '--quiet', 'master'])).trim();
     if (masterSha) {
       const [behindOut, aheadOut, mbOut, numstatOut, nameStatusOut] = await Promise.all([
         git(repoPath, ['rev-list', '--count', 'HEAD..master']),
@@ -131,6 +140,11 @@ async function collectRepo(repoPath) {
   const aheadUpstreamOut = await git(repoPath, ['rev-list', '--count', '@{u}..HEAD']);
   const aheadUpstream = aheadUpstreamOut.trim() === '' ? null : +aheadUpstreamOut.trim();
 
+  // branch repos: only commits not already on master; master itself: recent history
+  const logOut = vsMaster
+    ? await git(repoPath, ['log', '-n', '50', '--pretty=format:%x01%H%x02%h%x02%s%x02%cr', '--shortstat', 'master..HEAD'])
+    : await git(repoPath, ['log', '-n', '30', '--pretty=format:%x01%H%x02%h%x02%s%x02%cr', '--shortstat']);
+
   const commits = [];
   for (const entry of logOut.split('\x01')) {
     if (!entry.trim()) continue;
@@ -140,12 +154,16 @@ async function collectRepo(repoPath) {
     const s = statLine ? parseShortstatLine(statLine) : { add: 0, del: 0, files: 0 };
     commits.push({ hash, short, subject, when, ...s });
   }
-  const shownCommits =
-    aheadUpstream != null && aheadUpstream > 0 ? commits.slice(0, aheadUpstream) : commits.slice(0, 8);
-  const commitsLabel =
-    aheadUpstream != null && aheadUpstream > 0 ? `Outgoing commits (${aheadUpstream})` : 'Recent commits';
+  const shownCommits = vsMaster
+    ? commits
+    : aheadUpstream != null && aheadUpstream > 0
+      ? commits.slice(0, aheadUpstream)
+      : commits.slice(0, 8);
+  const commitsLabel = `Commits (${shownCommits.length})`;
 
   const totals = sumFiles([...staged, ...unstaged, ...untracked]);
+  const dirtyCount = staged.length + unstaged.length + untracked.length;
+  const ci = await collectCi(repoPath, branch, vsMaster, dirtyCount, masterSha);
   return {
     repoPath,
     name: path.basename(repoPath),
@@ -158,7 +176,42 @@ async function collectRepo(repoPath) {
     commits: shownCommits,
     commitsLabel,
     upstream: aheadUpstream != null,
+    ci,
   };
+}
+
+function ciCommandPath() {
+  return (vscode.workspace.getConfiguration('scmDiffStats').get('ciCommand') || '').trim();
+}
+
+// Land-readiness of a scripts/ci PR worktree: the .ci/pr-N.tested.json green
+// record must name exactly this HEAD, and master must not have moved since.
+async function collectCi(repoPath, branch, vsMaster, dirtyCount, masterSha) {
+  if (!ciCommandPath()) return null;
+  if (!branch || branch === 'master') return null;
+  const m = path.basename(repoPath).match(/^pr-(\d+)$/);
+  if (!m) return null;
+  const serial = +m[1];
+  // only new-style PRs (with their docs/PR_N folder) — not old review worktrees
+  if (!fs.existsSync(path.join(repoPath, 'docs', 'PR_' + serial))) return null;
+  let tested = null;
+  try {
+    tested = JSON.parse(fs.readFileSync(path.join(path.dirname(repoPath), '.ci', 'pr-' + serial + '.tested.json')));
+  } catch { /* no green record yet */ }
+  const headSha = (await git(repoPath, ['rev-parse', 'HEAD'])).trim();
+  let state, reason = '';
+  if (dirtyCount || !tested || tested.branch_sha !== headSha) {
+    state = 'untested';
+    reason = dirtyCount
+      ? 'working tree changed since the last green run'
+      : tested ? 'HEAD is not the tested revision' : 'no green test record';
+  } else if ((vsMaster && vsMaster.behind > 0) || tested.master_sha !== masterSha) {
+    state = 'behind';
+    reason = 'master moved since the green run';
+  } else {
+    state = 'ready';
+  }
+  return { serial, state, reason, suite: tested && tested.suite, time: tested && tested.time };
 }
 
 function getHtml(nonce) {
@@ -199,6 +252,18 @@ function getHtml(nonce) {
           border: none; border-radius: 2px; padding: 0 6px; margin-left: 8px; cursor: pointer;
           font-family: inherit; font-size: .85em; height: 18px; white-space: nowrap; flex: none; }
   .sbtn:hover { background: var(--vscode-button-secondaryHoverBackground); }
+  .agent { color: var(--vscode-charts-yellow, #d7ba7d); margin-left: 8px; font-size: .85em; flex: none;
+           animation: agentpulse 2s ease-in-out infinite; }
+  @keyframes agentpulse { 50% { opacity: .4; } }
+  .ibtn { background: var(--vscode-button-secondaryBackground); color: var(--vscode-button-secondaryForeground);
+          border: none; border-radius: 2px; width: 20px; padding: 0; margin-left: 4px; cursor: pointer;
+          font-family: inherit; font-size: .9em; height: 18px; line-height: 18px; flex: none; text-align: center; }
+  .ibtn:hover { background: var(--vscode-button-secondaryHoverBackground); }
+  .ibtn.blocked { opacity: .45; }
+  .cist { margin-left: 6px; flex: none; font-weight: 700; cursor: default; }
+  .ci-ready { color: var(--vscode-charts-green, #89d185); }
+  .ci-behind { color: var(--vscode-gitDecoration-deletedResourceForeground); }
+  .ci-untested { color: var(--vscode-charts-yellow, #d7ba7d); }
 </style>
 </head>
 <body>
@@ -206,7 +271,10 @@ function getHtml(nonce) {
 <script nonce="${nonce}">
 const vscode = acquireVsCodeApi();
 let repos = [];
+let agents = {};
 let syncEnabled = false;
+let previewEnabled = false;
+let ciEnabled = false;
 let pendingRepos = null;
 const commitFiles = {};
 const state = vscode.getState() || { collapsed: {} };
@@ -216,6 +284,34 @@ state.drafts = state.drafts || {};
 function esc(s) { return String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
 function isCollapsed(id, dflt) { return state.collapsed[id] !== undefined ? state.collapsed[id] : dflt; }
 function toggle(id, dflt) { state.collapsed[id] = !isCollapsed(id, dflt); vscode.setState(state); render(); }
+
+function ciBtn(repoPath, serial, cmd, glyph, tip, blocked) {
+  return '<button class="ibtn' + (blocked ? ' blocked' : '') + '" data-repo="' + esc(repoPath)
+    + '" data-serial="' + serial + '" data-cmd="' + cmd + '" title="' + esc(tip) + '">' + glyph + '</button>';
+}
+
+function ciHtml(r) {
+  if (ciEnabled && r.branch === 'master') {
+    return ciBtn(r.repoPath, '', 'new', '✚', 'ci new — create a new PR: worktree, branch, docs/PR_N, database');
+  }
+  if (!r.ci) return '';
+  const c = r.ci, s = c.serial;
+  let st;
+  if (c.state === 'ready') {
+    st = '<span class="cist ci-ready" title="tested (' + esc(c.suite || '') + ') ' + esc(c.time || '')
+      + ' — ready to land">✓</span>';
+  } else if (c.state === 'behind') {
+    st = '<span class="cist ci-behind" title="land blocked: behind master — ' + esc(c.reason)
+      + '. Run ci test ' + s + '.">↓</span>';
+  } else {
+    st = '<span class="cist ci-untested" title="land blocked: not tested — ' + esc(c.reason)
+      + '. Run ci test ' + s + '.">○</span>';
+  }
+  return ciBtn(r.repoPath, s, 'preview', '▷', 'ci preview ' + s + ' — start the preview server and open the changed pages in Edge')
+    + ciBtn(r.repoPath, s, 'test', '⇣', 'ci test ' + s + ' --fix — sync with master, run the gate, let Claude fix failures')
+    + ciBtn(r.repoPath, s, 'land', '⇪', 'ci land ' + s + ' — squash-merge onto master (interactive terminal)', c.state !== 'ready')
+    + st;
+}
 
 function cols(add, del, letter, binary) {
   const st = letter ? '<span class="st st-' + esc(letter) + '">' + esc(letter) + '</span>' : '<span class="st"></span>';
@@ -256,8 +352,29 @@ function render() {
     const rid = 'r|' + r.repoPath;
     const rc = isCollapsed(rid, false);
     const t = r.totals;
-    h += row(0, { hdr: true, twist: rc, name: esc(r.name), dim: esc(r.branch),
-      cols: (t.add || t.del) ? cols(t.add, t.del, null, false) : '', act: 't|' + rid + '|0' });
+    const ag = agents[r.repoPath] || [];
+    let agentHtml = '';
+    if (ag.length) {
+      const byKind = {};
+      for (const a of ag) byKind[a.kind] = (byKind[a.kind] || 0) + 1;
+      const label = Object.entries(byKind).map(([k, n]) => (n > 1 ? k + ' ×' + n : k)).join(', ');
+      agentHtml = '<span class="agent" title="agent process(es) running in this worktree: '
+        + esc(ag.map(a => a.kind + ' (pid ' + a.pid + ')').join(', ')) + '">● ' + esc(label) + '</span>';
+    }
+    const ci = ciHtml(r);
+    const previewBtn = (!ci && previewEnabled && r.branch !== 'master')
+      ? '<button class="sbtn pbtn" data-repo="' + esc(r.repoPath) + '" title="start the worktree preview server and open its changed pages (max 5) in the browser">▷ preview</button>'
+      : '';
+    // collapsed repos summarize their diff vs master; expanded ones show working-tree totals
+    let repoDim = esc(r.branch);
+    let repoCols = (t.add || t.del) ? cols(t.add, t.del, null, false) : '';
+    if (rc && r.vsMaster) {
+      const v = r.vsMaster;
+      repoCols = cols(v.totals.add, v.totals.del, null, false);
+      if (v.behind) repoDim += ' <span class="behind">↓' + v.behind + '</span>';
+    }
+    h += row(0, { hdr: true, twist: rc, name: esc(r.name), dim: repoDim, btns: ci + previewBtn + agentHtml,
+      cols: repoCols, act: 't|' + rid + '|0' });
     if (rc) continue;
 
     if (r.staged.length + r.unstaged.length + r.untracked.length > 0) {
@@ -294,7 +411,7 @@ function render() {
         : 'not behind master';
       h += row(1, { hdr: true, twist: vc, name: 'Vs master (' + v.files.length + ')',
         dim: behind + ' · ↑' + v.ahead, cols: cols(v.totals.add, v.totals.del, null, false),
-        btns: syncEnabled ? '<button class="sbtn" data-repo="' + esc(r.repoPath) + '" title="merge master in, run the full test suite, launch a fix agent on failure">⇣ sync + test</button>' : '',
+        btns: (syncEnabled && !r.ci) ? '<button class="sbtn" data-repo="' + esc(r.repoPath) + '" title="merge master in, run the full test suite, launch a fix agent on failure">⇣ sync + test</button>' : '',
         act: 't|' + vid + '|0' });
       if (!vc) for (const f of v.files) {
         h += fileRow(2, r.repoPath, f, 'm|' + r.repoPath + '|' + v.mergeBase + '|' + f.path);
@@ -348,6 +465,14 @@ document.addEventListener('keydown', (ev) => {
 document.addEventListener('pointerdown', (ev) => {
   const btn = ev.target.closest && ev.target.closest('button.cbtn');
   if (btn) { ev.preventDefault(); doCommit(btn.dataset.repo, btn.dataset.push === '1'); return; }
+  const ibtn = ev.target.closest && ev.target.closest('button.ibtn');
+  if (ibtn) {
+    ev.preventDefault();
+    vscode.postMessage({ type: 'ci', cmd: ibtn.dataset.cmd, repoPath: ibtn.dataset.repo, serial: ibtn.dataset.serial });
+    return;
+  }
+  const pbtn = ev.target.closest && ev.target.closest('button.pbtn');
+  if (pbtn) { ev.preventDefault(); vscode.postMessage({ type: 'preview', repoPath: pbtn.dataset.repo }); return; }
   const sbtn = ev.target.closest && ev.target.closest('button.sbtn');
   if (sbtn) { ev.preventDefault(); vscode.postMessage({ type: 'synctest', repoPath: sbtn.dataset.repo }); }
 });
@@ -395,6 +520,9 @@ window.addEventListener('message', (ev) => {
   const m = ev.data;
   if (m.type === 'data') {
     syncEnabled = !!m.syncEnabled;
+    previewEnabled = !!m.previewEnabled;
+    ciEnabled = !!m.ciEnabled;
+    agents = m.agents || {};
     // don't re-render while a commit message is being typed
     if (document.activeElement && document.activeElement.classList && document.activeElement.classList.contains('cmsg')) {
       pendingRepos = m.repos;
@@ -421,6 +549,42 @@ vscode.postMessage({ type: 'ready' });
 </html>`;
 }
 
+function scanAgents(repoPaths) {
+  // agent processes (claude/codex) whose cwd is inside one of the repos
+  const map = {};
+  const candidates = [];
+  let pids = [];
+  try { pids = fs.readdirSync('/proc').filter((d) => /^\d+$/.test(d)); } catch { return map; }
+  for (const pid of pids) {
+    let cwd, cmd, ppid = 0;
+    try {
+      cwd = fs.readlinkSync(`/proc/${pid}/cwd`);
+      cmd = fs.readFileSync(`/proc/${pid}/cmdline`).toString().split('\0').filter(Boolean);
+      const stat = fs.readFileSync(`/proc/${pid}/stat`).toString();
+      ppid = +stat.slice(stat.lastIndexOf(')') + 2).split(' ')[1];
+    } catch { continue; }
+    if (!cmd.length) continue;
+    const exe = path.basename(cmd[0]);
+    let kind = null;
+    if (exe === 'claude' || cmd[0].includes('native-binary/claude')) kind = 'claude';
+    else if (exe === 'codex') kind = 'codex';
+    else continue;
+    candidates.push({ pid: +pid, ppid, kind, cwd });
+  }
+  // one session = one badge: drop children whose parent is itself an agent process
+  const agentPids = new Set(candidates.map((c) => c.pid));
+  for (const c of candidates) {
+    if (agentPids.has(c.ppid)) continue;
+    for (const rp of repoPaths) {
+      if (c.cwd === rp || c.cwd.startsWith(rp + path.sep)) {
+        (map[rp] = map[rp] || []).push({ pid: c.pid, kind: c.kind });
+        break;
+      }
+    }
+  }
+  return map;
+}
+
 function findClaudeBin() {
   try {
     const extDir = path.join(process.env.HOME || '', '.vscode-server', 'extensions');
@@ -442,11 +606,109 @@ class StatsViewProvider {
     this.data = new Map();
     this.fileStats = new Map();
     this.running = new Set();
+    this.agents = {};
     this.channel = vscode.window.createOutputChannel('Diff Stats');
   }
 
   syncCommand() {
     return (vscode.workspace.getConfiguration('scmDiffStats').get('syncTestCommand') || '').trim();
+  }
+
+  previewCommand() {
+    return (vscode.workspace.getConfiguration('scmDiffStats').get('previewCommand') || '').trim();
+  }
+
+  browserCommand() {
+    return (vscode.workspace.getConfiguration('scmDiffStats').get('browserCommand') || '').trim();
+  }
+
+  async runPreview(repoPath) {
+    const name = path.basename(repoPath);
+    const key = 'preview:' + repoPath;
+    if (this.running.has(key)) {
+      vscode.window.showWarningMessage(`${name}: preview is already starting`);
+      return;
+    }
+    const template = this.previewCommand();
+    if (!template) {
+      vscode.window.showErrorMessage('Set scmDiffStats.previewCommand in your settings first.');
+      return;
+    }
+    const cmd = template.replace(/\$\{name\}/g, name).replace(/\$\{repoPath\}/g, repoPath);
+    this.running.add(key);
+    this.channel.appendLine(`\n=== ${new Date().toLocaleTimeString()} · ${name}: ${cmd}`);
+    let out = '';
+    const append = (buf) => {
+      const s = buf.toString();
+      this.channel.append(s);
+      out += s;
+    };
+    try {
+      const code = await vscode.window.withProgress(
+        { location: vscode.ProgressLocation.Window, title: `preview: ${name}` },
+        () => new Promise((resolve) => {
+          const child = cp.spawn('bash', ['-lc', cmd], { cwd: repoPath });
+          child.stdout.on('data', append);
+          child.stderr.on('data', append);
+          child.on('close', resolve);
+          child.on('error', (e) => { append(String(e)); resolve(1); });
+        })
+      );
+      if (code !== 0) {
+        this.channel.show(true);
+        vscode.window.showErrorMessage(`${name}: preview command failed — see the Diff Stats output.`);
+        return;
+      }
+      // base URL: prefer this worktree's status line, else the last URL printed
+      let base = null;
+      const line = out.match(new RegExp('^\\s*' + name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\s+\\S+\\s+(https?://\\S+)', 'm'));
+      if (line) base = line[1];
+      if (!base) {
+        const urls = out.match(/https?:\/\/[\d.]+:\d+/g);
+        base = urls ? urls[urls.length - 1] : null;
+      }
+      if (!base) {
+        this.channel.show(true);
+        vscode.window.showErrorMessage(`${name}: could not find the preview URL in the command output.`);
+        return;
+      }
+      base = base.replace(/\/+$/, '');
+
+      // changed pages from the worktree's frontend-review manifests (at most 5):
+      // legacy .frontend-review.json plus numbered .frontend-review/NNNN-slug.json,
+      // later files superseding earlier entries for the same URL
+      const byUrl = new Set();
+      const addManifest = (file) => {
+        try {
+          const manifest = JSON.parse(fs.readFileSync(file));
+          for (const p of manifest.pages || []) {
+            if (typeof p.url === 'string' && p.url.startsWith('/')) byUrl.add(p.url);
+          }
+        } catch { /* ignore missing or unreadable manifests */ }
+      };
+      addManifest(path.join(repoPath, '.frontend-review.json'));
+      try {
+        const dir = path.join(repoPath, '.frontend-review');
+        for (const n of fs.readdirSync(dir).filter((n) => /^\d{4}(-[a-z0-9-]+)?\.json$/.test(n)).sort()) {
+          addManifest(path.join(dir, n));
+        }
+      } catch { /* no manifest directory */ }
+      const pages = [...byUrl];
+      const urls = (pages.length ? pages.slice(0, 5).map((u) => base + u) : [base]);
+
+      const bcmd = this.browserCommand();
+      if (bcmd) {
+        const full = bcmd.replace(/\$\{urls\}/g, urls.map((u) => '"' + u + '"').join(' '));
+        this.channel.appendLine(`launching browser: ${full}`);
+        const child = cp.spawn('bash', ['-lc', full], { detached: true, stdio: 'ignore' });
+        child.unref();
+      } else {
+        for (const u of urls) vscode.env.openExternal(vscode.Uri.parse(u));
+      }
+      vscode.window.setStatusBarMessage(`$(globe) ${name}: opened ${urls.length} page(s) at ${base}`, 8000);
+    } finally {
+      this.running.delete(key);
+    }
   }
 
   async runSyncTest(repoPath) {
@@ -517,12 +779,40 @@ class StatsViewProvider {
     vscode.window.showWarningMessage(`${name}: sync + test failed — launched a fix agent in the terminal.`);
   }
 
+  async runCi(cmd, repoPath, serial) {
+    const ci = ciCommandPath();
+    if (!ci) return;
+    let args;
+    if (cmd === 'new') {
+      const slug = await vscode.window.showInputBox({
+        prompt: 'Slug for the new PR (lowercase kebab-case)',
+        validateInput: (v) => (/^[a-z0-9][a-z0-9-]*$/.test(v) ? null : 'lowercase kebab-case'),
+      });
+      if (!slug) return;
+      args = ['new', slug];
+    } else if (!/^\d+$/.test(String(serial))) {
+      return;
+    } else if (cmd === 'test') {
+      args = ['test', String(serial), '--fix'];
+    } else if (cmd === 'preview' || cmd === 'land') {
+      args = [cmd, String(serial)];
+    } else {
+      return;
+    }
+    // a real terminal: land's TTY gate and confirmation prompt need one,
+    // and test/preview output stays visible and interactive
+    const term = vscode.window.createTerminal({ name: 'ci ' + args.join(' '), cwd: repoPath });
+    term.show();
+    term.sendText("'" + ci + "' " + args.join(' '));
+  }
+
   setRepos(paths) {
     this.repos = paths;
     this.refresh();
   }
 
   async refresh() {
+    this.agents = scanAgents(this.repos);
     const results = await Promise.all(this.repos.map((r) => collectRepo(r).catch(() => null)));
     this.data.clear();
     this.fileStats.clear();
@@ -539,7 +829,11 @@ class StatsViewProvider {
   push() {
     if (!this.view) return;
     const repos = this.repos.filter((r) => this.data.has(r)).map((r) => this.data.get(r));
-    this.view.webview.postMessage({ type: 'data', repos, syncEnabled: !!this.syncCommand() });
+    this.view.webview.postMessage({
+      type: 'data', repos, syncEnabled: !!this.syncCommand(),
+      previewEnabled: !!this.previewCommand(), ciEnabled: !!ciCommandPath(),
+      agents: this.agents,
+    });
   }
 
   resolveWebviewView(view) {
@@ -563,6 +857,10 @@ class StatsViewProvider {
       if (this.view) this.view.webview.postMessage({ type: 'commitFiles', repoPath: m.repoPath, hash: m.hash, files });
     } else if (m.type === 'synctest') {
       this.runSyncTest(m.repoPath);
+    } else if (m.type === 'preview') {
+      this.runPreview(m.repoPath);
+    } else if (m.type === 'ci') {
+      this.runCi(m.cmd, m.repoPath, m.serial);
     } else if (m.type === 'commit') {
       const repoName = path.basename(m.repoPath);
       const steps = [
@@ -591,12 +889,20 @@ class StatsViewProvider {
             vscode.commands.executeCommand('vscode.open', uri)
           );
         } else if (m.mode === 'vsmaster' && gitApi) {
-          const left = gitApi.toGitUri(uri, m.mergeBase);
-          const right = fs.existsSync(uri.fsPath) ? uri : gitApi.toGitUri(uri, 'HEAD');
+          // a side that does not exist (file added/deleted on the branch)
+          // must be an empty document, not a nonexistent git object
+          const left = (await existsAtRef(m.repoPath, m.mergeBase, m.path))
+            ? gitApi.toGitUri(uri, m.mergeBase)
+            : emptyUri(uri);
+          const right = fs.existsSync(uri.fsPath) ? uri : emptyUri(uri);
           await vscode.commands.executeCommand('vscode.diff', left, right, `${base} (master ↔ branch)`);
         } else if (m.mode === 'commit' && gitApi) {
-          const left = gitApi.toGitUri(uri, `${m.hash}^`);
-          const right = gitApi.toGitUri(uri, m.hash);
+          const left = (await existsAtRef(m.repoPath, `${m.hash}^`, m.path))
+            ? gitApi.toGitUri(uri, `${m.hash}^`)
+            : emptyUri(uri);
+          const right = (await existsAtRef(m.repoPath, m.hash, m.path))
+            ? gitApi.toGitUri(uri, m.hash)
+            : emptyUri(uri);
           await vscode.commands.executeCommand('vscode.diff', left, right, `${base} @ ${m.hash.slice(0, 7)}`);
         } else {
           await vscode.commands.executeCommand('vscode.open', uri);
@@ -612,6 +918,11 @@ function activate(context) {
   const provider = new StatsViewProvider();
   context.subscriptions.push(vscode.window.registerWebviewViewProvider('scmDiffStats', provider));
   context.subscriptions.push(vscode.commands.registerCommand('scmDiffStats.refresh', () => provider.refresh()));
+  context.subscriptions.push(
+    vscode.workspace.registerTextDocumentContentProvider(EMPTY_SCHEME, {
+      provideTextDocumentContent: () => '',
+    })
+  );
 
   const decoEmitter = new vscode.EventEmitter();
   context.subscriptions.push(
@@ -633,11 +944,28 @@ function activate(context) {
     }, 700);
   };
 
+  // every worktree of every known repo gets a row, even when it is not a
+  // workspace folder (ci new creates worktrees without touching the workspace)
+  const expandWorktrees = async (paths) => {
+    const all = new Set(paths);
+    for (const p of paths) {
+      const out = await git(p, ['worktree', 'list', '--porcelain']);
+      for (const line of out.split('\n')) {
+        if (line.startsWith('worktree ')) {
+          const wt = line.slice(9).trim();
+          if (wt && fs.existsSync(wt)) all.add(wt);
+        }
+      }
+    }
+    return [...all];
+  };
+
   const wireGitApi = async () => {
     const gitExt = vscode.extensions.getExtension('vscode.git');
     if (!gitExt) return false;
     gitApi = (await gitExt.activate()).getAPI(1);
-    const sync = () => provider.setRepos(gitApi.repositories.map((r) => r.rootUri.fsPath));
+    const sync = () =>
+      expandWorktrees(gitApi.repositories.map((r) => r.rootUri.fsPath)).then((ps) => provider.setRepos(ps));
     context.subscriptions.push(gitApi.onDidOpenRepository((repo) => {
       context.subscriptions.push(repo.state.onDidChange(scheduleRefresh));
       sync();
@@ -655,11 +983,43 @@ function activate(context) {
       const folders = (vscode.workspace.workspaceFolders || []).map((f) => f.uri.fsPath);
       Promise.all(
         folders.map(async (f) => ((await git(f, ['rev-parse', '--is-inside-work-tree'])).trim() === 'true' ? f : null))
-      ).then((rs) => provider.setRepos(rs.filter(Boolean)));
+      ).then((rs) => expandWorktrees(rs.filter(Boolean))).then((ps) => provider.setRepos(ps));
     }
   });
 
+  // worktrees outside the workspace get no git-extension change events;
+  // a slow poll keeps their rows (and the land-readiness state) current
+  const repoPoll = setInterval(() => {
+    if (gitApi && gitApi.repositories.length) {
+      expandWorktrees(gitApi.repositories.map((r) => r.rootUri.fsPath)).then((ps) => {
+        if (ps.length !== provider.repos.length || ps.some((p) => !provider.repos.includes(p))) {
+          provider.setRepos(ps);
+        } else {
+          scheduleRefresh();
+        }
+      });
+    } else {
+      scheduleRefresh();
+    }
+  }, 15000);
+  context.subscriptions.push({ dispose: () => clearInterval(repoPoll) });
+
   context.subscriptions.push(vscode.workspace.onDidSaveTextDocument(scheduleRefresh));
+  context.subscriptions.push(vscode.window.onDidCloseTerminal((t) => {
+    if (t.name && t.name.startsWith('ci ')) scheduleRefresh();
+  }));
+  context.subscriptions.push(vscode.workspace.onDidChangeConfiguration((e) => {
+    if (e.affectsConfiguration('scmDiffStats')) provider.refresh();
+  }));
+
+  const agentPoll = setInterval(() => {
+    const a = scanAgents(provider.repos);
+    if (JSON.stringify(a) !== JSON.stringify(provider.agents)) {
+      provider.agents = a;
+      provider.push();
+    }
+  }, 7000);
+  context.subscriptions.push({ dispose: () => clearInterval(agentPoll) });
 }
 
 function deactivate() {}
