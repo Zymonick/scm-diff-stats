@@ -194,9 +194,15 @@ async function collectCi(repoPath, branch, vsMaster, dirtyCount, masterSha) {
   const serial = +m[1];
   // only new-style PRs (with their docs/PR_N folder) — not old review worktrees
   if (!fs.existsSync(path.join(repoPath, 'docs', 'PR_' + serial))) return null;
+  const ciState = path.join(path.dirname(repoPath), '.ci');
+  let summary = '';
+  try {
+    const slug = fs.readFileSync(path.join(ciState, 'pr-' + serial + '.slug'), 'utf8').trim();
+    if (/^[a-z0-9]+(?:-[a-z0-9]+){2}$/.test(slug)) summary = slug.replace(/-/g, ' ');
+  } catch { /* pre-summary PR */ }
   let tested = null;
   try {
-    tested = JSON.parse(fs.readFileSync(path.join(path.dirname(repoPath), '.ci', 'pr-' + serial + '.tested.json')));
+    tested = JSON.parse(fs.readFileSync(path.join(ciState, 'pr-' + serial + '.tested.json')));
   } catch { /* no green record yet */ }
   const headSha = (await git(repoPath, ['rev-parse', 'HEAD'])).trim();
   let state, reason = '';
@@ -211,7 +217,7 @@ async function collectCi(repoPath, branch, vsMaster, dirtyCount, masterSha) {
   } else {
     state = 'ready';
   }
-  return { serial, state, reason, suite: tested && tested.suite, time: tested && tested.time };
+  return { serial, summary, state, reason, suite: tested && tested.suite, time: tested && tested.time };
 }
 
 function getHtml(nonce) {
@@ -366,7 +372,7 @@ function render() {
       ? '<button class="sbtn pbtn" data-repo="' + esc(r.repoPath) + '" title="start the worktree preview server and open its changed pages (max 5) in the browser">▷ preview</button>'
       : '';
     // collapsed repos summarize their diff vs master; expanded ones show working-tree totals
-    let repoDim = esc(r.branch);
+    let repoDim = esc(rc && r.ci && r.ci.summary ? r.ci.summary : r.branch);
     let repoCols = (t.add || t.del) ? cols(t.add, t.del, null, false) : '';
     if (rc && r.vsMaster) {
       const v = r.vsMaster;
@@ -691,7 +697,15 @@ class StatsViewProvider {
       vscode.window.showErrorMessage('Set scmDiffStats.previewCommand in your settings first.');
       return;
     }
-    const cmd = template.replace(/\$\{name\}/g, name).replace(/\$\{repoPath\}/g, repoPath);
+    const number = (name.match(/^pr-(\d+)$/) || [])[1];
+    if (template.includes('${number}') && !number) {
+      vscode.window.showErrorMessage(`${name}: preview command requires a pr-N worktree.`);
+      return;
+    }
+    const cmd = template
+      .replace(/\$\{number\}/g, number || '')
+      .replace(/\$\{name\}/g, name)
+      .replace(/\$\{repoPath\}/g, repoPath);
     this.running.add(key);
     this.channel.appendLine(`\n=== ${new Date().toLocaleTimeString()} · ${name}: ${cmd}`);
     let out = '';
@@ -841,11 +855,17 @@ class StatsViewProvider {
     if (!ci) return;
     let args;
     if (cmd === 'new') {
-      const slug = await vscode.window.showInputBox({
-        prompt: 'Slug for the new PR (lowercase kebab-case)',
-        validateInput: (v) => (/^[a-z0-9][a-z0-9-]*$/.test(v) ? null : 'lowercase kebab-case'),
+      const summary = await vscode.window.showInputBox({
+        prompt: 'Three-word PR summary (lowercase words)',
+        placeHolder: 'three word summary',
+        validateInput: (v) => {
+          const slug = v.trim().replace(/\s+/g, '-');
+          return /^[a-z0-9]+(?:-[a-z0-9]+){2}$/.test(slug)
+            ? null : 'enter exactly three lowercase letters/digits words';
+        },
       });
-      if (!slug) return;
+      if (!summary) return;
+      const slug = summary.trim().replace(/\s+/g, '-');
       args = ['new', slug];
     } else if (!/^\d+$/.test(String(serial))) {
       return;
